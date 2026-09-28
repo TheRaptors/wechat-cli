@@ -52,11 +52,15 @@ jobs:
 
       - name: Smoke test
         shell: bash
+        env:
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: utf-8
         run: |
           BIN="npm/platforms/${{ matrix.platform }}/bin/${{ matrix.artifact }}"
           chmod +x "$BIN" || true
-          "$BIN" --help
+          # Frozen Windows exe may not honor PYTHONUTF8; entry.py reconfigures stdout.
           "$BIN" --version
+          "$BIN" --help >/dev/null
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
