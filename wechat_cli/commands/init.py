@@ -6,7 +6,9 @@ import sys
 
 import click
 
-from ..core.config import STATE_DIR, CONFIG_FILE, KEYS_FILE, auto_detect_db_dir
+from ..core.config import (
+    STATE_DIR, CONFIG_FILE, KEYS_FILE, auto_detect_db_dir, resolve_db_storage_dir,
+)
 
 
 @click.command()
@@ -36,11 +38,22 @@ def init(db_dir, force):
             sys.exit(1)
         click.echo(f"[+] 检测到微信数据目录: {db_dir}")
     else:
-        db_dir = os.path.abspath(db_dir)
+        db_dir = os.path.abspath(os.path.expanduser(db_dir))
         if not os.path.isdir(db_dir):
             click.echo(f"[!] 目录不存在: {db_dir}", err=True)
             sys.exit(1)
         click.echo(f"[+] 使用指定数据目录: {db_dir}")
+
+    resolved = resolve_db_storage_dir(db_dir)
+    if resolved and os.path.normcase(resolved) != os.path.normcase(db_dir):
+        click.echo(f"[+] 已归一到 db_storage: {resolved}")
+        db_dir = resolved
+    elif os.path.basename(db_dir.rstrip("\\/")) != "db_storage":
+        click.echo(
+            "[!] 当前目录不是 db_storage，密钥路径可能无法与查询命令对齐。"
+            "建议指定到 .../<账号>/db_storage",
+            err=True,
+        )
 
     # 4. 提取密钥
     click.echo("\n开始提取密钥...")

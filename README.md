@@ -326,10 +326,11 @@ The `--type` option (on `history` and `search`):
 
 ## 💻 System Requirements
 
-- **macOS** ≥ 26.3.1
-- **WeChat for Mac** ≤ 4.1.8.100
+- **macOS** ≥ 26.3.1 (Mac key extraction still relies on memory scan / re-signing)
+- **Windows**: WeChat 4.0.x ~ 4.1.x (including 4.1.11+ / 4.1.15). `init` prefers a read-only `Config.Cipher` runtime scan, then falls back to legacy `x'<hex>'` memory scanning
+- **Linux**: WeChat 4.0.x memory scan works; 4.1+ needs a debugger-based capture path (planned)
 
-> Older macOS versions or newer WeChat versions may not be compatible.
+> On Mac/Linux, newer WeChat builds that no longer cache raw keys may need the passphrase + PBKDF2 path in a follow-up.
 
 ---
 
@@ -373,7 +374,11 @@ This project is a local data query tool for personal use only. Please note:
 
 ## 🙏 Acknowledgements
 
-This project is built on top of [wechat-decrypt](https://github.com/ylytdeng/wechat-decrypt), which provides the core WeChat database decryption and data parsing capabilities.
+This project is based on / forked from the following open-source work:
+
+- [freestylefly/wechat-cli](https://github.com/freestylefly/wechat-cli) — the original WeChat CLI (query chat history, contacts, sessions, etc.)
+- [ylytdeng/wechat-decrypt](https://github.com/ylytdeng/wechat-decrypt) — WeChat database decryption and data parsing foundations
+- [TANGandXUE/wcdb-key-tool](https://github.com/TANGandXUE/wcdb-key-tool) — WeChat 4.1+ key extraction (`Config.Cipher` runtime scan / PBKDF2 passphrase derivation), used to update Windows `init` for newer WeChat versions
 
 ---
 

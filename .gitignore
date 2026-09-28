@@ -42,3 +42,6 @@ Thumbs.db
 # Temp files
 *.tmp
 *.bak
+
+# Local reference clones (not part of the package)
+wcdb-key-tool/

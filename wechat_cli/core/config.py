@@ -45,37 +45,86 @@ def _choose_candidate(candidates):
     return None
 
 
+def _collect_db_storage_candidates(roots):
+    """从若干根目录收集 */db_storage 候选。"""
+    seen = set()
+    candidates = []
+    patterns = []
+    for root in roots:
+        if not root:
+            continue
+        root = os.path.abspath(root)
+        if not os.path.isdir(root):
+            continue
+        base = os.path.basename(root.rstrip("\\/"))
+        if base == "db_storage":
+            patterns.append(root)
+            continue
+        if base == "xwechat_files":
+            patterns.append(os.path.join(root, "*", "db_storage"))
+        else:
+            patterns.append(os.path.join(root, "xwechat_files", "*", "db_storage"))
+            patterns.append(os.path.join(root, "*", "db_storage"))
+        nested = os.path.join(root, "db_storage")
+        if os.path.isdir(nested):
+            patterns.append(nested)
+
+    for pattern in patterns:
+        matches = [pattern] if os.path.isdir(pattern) and "*" not in pattern else glob_mod.glob(pattern)
+        for match in matches:
+            if not os.path.isdir(match):
+                continue
+            if os.path.basename(match.rstrip("\\/")) != "db_storage":
+                continue
+            normalized = os.path.normcase(os.path.normpath(match))
+            if normalized not in seen:
+                seen.add(normalized)
+                candidates.append(match)
+    return candidates
+
+
+def resolve_db_storage_dir(path):
+    """把用户传入的路径归一到具体账号的 db_storage 目录。"""
+    if not path:
+        return None
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isdir(path):
+        return None
+    if os.path.basename(path.rstrip("\\/")) == "db_storage":
+        return path
+    candidates = _collect_db_storage_candidates([path])
+    if not candidates:
+        return path
+    return _choose_candidate(candidates)
+
+
 def _auto_detect_db_dir_windows():
     appdata = os.environ.get("APPDATA", "")
     config_dir = os.path.join(appdata, "Tencent", "xwechat", "config")
-    if not os.path.isdir(config_dir):
-        return None
     data_roots = []
-    for ini_file in glob_mod.glob(os.path.join(config_dir, "*.ini")):
-        try:
-            content = None
-            for enc in ("utf-8", "gbk"):
-                try:
-                    with open(ini_file, "r", encoding=enc) as f:
-                        content = f.read(1024).strip()
-                    break
-                except UnicodeDecodeError:
+    if os.path.isdir(config_dir):
+        for ini_file in glob_mod.glob(os.path.join(config_dir, "*.ini")):
+            try:
+                content = None
+                for enc in ("utf-8", "gbk"):
+                    try:
+                        with open(ini_file, "r", encoding=enc) as f:
+                            content = f.read(1024).strip()
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                if not content or any(c in content for c in "\n\r\x00"):
                     continue
-            if not content or any(c in content for c in "\n\r\x00"):
+                if os.path.isdir(content):
+                    data_roots.append(content)
+            except OSError:
                 continue
-            if os.path.isdir(content):
-                data_roots.append(content)
-        except OSError:
-            continue
-    seen = set()
-    candidates = []
-    for root in data_roots:
-        pattern = os.path.join(root, "xwechat_files", "*", "db_storage")
-        for match in glob_mod.glob(pattern):
-            normalized = os.path.normcase(os.path.normpath(match))
-            if os.path.isdir(match) and normalized not in seen:
-                seen.add(normalized)
-                candidates.append(match)
+    # 常见默认位置兜底（ini 可能直接指向 xwechat_files）
+    data_roots.extend([
+        os.path.join(os.path.expanduser("~"), "Documents"),
+        os.path.join(os.path.expanduser("~"), "Documents", "xwechat_files"),
+    ])
+    candidates = _collect_db_storage_candidates(data_roots)
     return _choose_candidate(candidates)
 
 
@@ -182,9 +231,16 @@ def load_config(config_path=None):
         if key in cfg and not os.path.isabs(cfg[key]):
             cfg[key] = os.path.join(state_dir, cfg[key])
 
-    # 推导微信数据根目录
+    # 若配置指向 xwechat_files / 账号根目录，归一到 db_storage
     db_dir = cfg.get("db_dir", "")
-    if db_dir and os.path.basename(db_dir) == "db_storage":
+    if db_dir:
+        resolved = resolve_db_storage_dir(db_dir)
+        if resolved:
+            cfg["db_dir"] = resolved
+            db_dir = resolved
+
+    # 推导微信数据根目录
+    if db_dir and os.path.basename(db_dir.rstrip("\\/")) == "db_storage":
         cfg["wechat_base_dir"] = os.path.dirname(db_dir)
     else:
         cfg["wechat_base_dir"] = db_dir

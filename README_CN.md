@@ -324,10 +324,11 @@ wechat-cli new-messages                    # 后续: 仅返回上次以来的新
 
 ## 💻 系统要求
 
-- **macOS** ≥ 26.3.1
-- **微信 Mac 版** ≤ 4.1.8.100
+- **macOS** ≥ 26.3.1（Mac 版密钥提取仍依赖内存扫描 / 重签名）
+- **Windows**：微信 4.0.x ~ 4.1.x（含 4.1.11+ / 4.1.15）。`init` 优先走 `Config.Cipher` 运行时扫描，失败再回退老版本 `x'<hex>'` 内存扫描
+- **Linux**：微信 4.0.x 内存扫描可用；4.1+ 需额外的调试器捕获方案（规划中）
 
-> macOS 老版本或更新的微信版本可能不兼容。
+> Mac / Linux 上更新的微信版本若已不再缓存明文密钥，可能需要后续接入 passphrase + PBKDF2 方案。
 
 ---
 
@@ -371,7 +372,11 @@ wechat-cli new-messages                    # 后续: 仅返回上次以来的新
 
 ## 🙏 致谢
 
-本项目基于 [wechat-decrypt](https://github.com/ylytdeng/wechat-decrypt) 开发，该仓库提供了微信数据库解密和数据解析的核心能力。
+本项目在以下开源工作基础上修改 / 衍生：
+
+- [freestylefly/wechat-cli](https://github.com/freestylefly/wechat-cli) — 原版微信 CLI（查询聊天记录、联系人、会话等）
+- [ylytdeng/wechat-decrypt](https://github.com/ylytdeng/wechat-decrypt) — 微信数据库解密与数据解析基础能力
+- [TANGandXUE/wcdb-key-tool](https://github.com/TANGandXUE/wcdb-key-tool) — 微信 4.1+ 密钥提取（`Config.Cipher` 运行时扫描 / PBKDF2 passphrase 派生），用于更新 Windows 端 `init` 以适配新版微信
 
 ---
 

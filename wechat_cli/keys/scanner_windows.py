@@ -1,20 +1,41 @@
-"""Windows 密钥提取 — 扫描 Weixin.exe 进程内存"""
+"""Windows 密钥提取 — Weixin.exe 进程内存
+
+优先走微信 4.1+ 的只读 Config.Cipher 运行时扫描；若未命中，再回退到
+老版本的 x'<hex>' raw key 内存扫描。逻辑移植自 wcdb-key-tool。
+"""
 
 import ctypes
 import ctypes.wintypes as wt
 import functools
-import os
 import re
+import struct
 import subprocess
 import time
 
-from .common import collect_db_files, scan_memory_for_keys, cross_verify_keys, save_results
+from .common import (
+    KEY_SZ,
+    collect_db_files,
+    cross_verify_keys,
+    save_results,
+    scan_memory_for_keys,
+    verify_enc_key,
+)
 
 print = functools.partial(print, flush=True)
 
 kernel32 = ctypes.windll.kernel32
 MEM_COMMIT = 0x1000
 READABLE = {0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80}
+
+CONFIG_CIPHER_NAME = b"com.Tencent.WCDB.Config.Cipher"
+# Config.Cipher blob 在内存中经固定掩码 XOR 后可还原出 x'<key><salt>' 字面量
+CONFIG_XOR_MASK = bytes.fromhex(
+    "d2c7442458020000004889442450488b"
+    "450048844c2448488944254048584c24"
+)
+MAX_USER_ADDRESS = 0x0000_8000_0000_0000
+CONFIG_BLOB_MAX = 1024
+CONFIG_LITERAL_RE = re.compile(rb"[xX]'([0-9a-fA-F]{64,192})'")
 
 
 class MBI(ctypes.Structure):
@@ -28,16 +49,20 @@ class MBI(ctypes.Structure):
 
 def _get_pids():
     """返回所有 Weixin.exe 进程的 (pid, mem_kb) 列表，按内存降序"""
-    r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Weixin.exe", "/FO", "CSV", "/NH"],
-                       capture_output=True, text=True)
+    r = subprocess.run(
+        ["tasklist", "/FI", "IMAGENAME eq Weixin.exe", "/FO", "CSV", "/NH"],
+        capture_output=True,
+        text=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
     pids = []
-    for line in r.stdout.strip().split('\n'):
+    for line in r.stdout.strip().split("\n"):
         if not line.strip():
             continue
         p = line.strip('"').split('","')
         if len(p) >= 5:
             pid = int(p[1])
-            mem = int(p[4].replace(',', '').replace(' K', '').strip() or '0')
+            mem = int(p[4].replace(",", "").replace(" K", "").strip() or "0")
             pids.append((pid, mem))
     if not pids:
         raise RuntimeError("Weixin.exe 未运行")
@@ -71,6 +96,213 @@ def _enum_regions(h):
     return regs
 
 
+def _xor_repeat(data, mask):
+    return bytes(value ^ mask[index % len(mask)] for index, value in enumerate(data))
+
+
+def _u64_from(data, offset):
+    if offset < 0 or offset + 8 > len(data):
+        return 0
+    return struct.unpack_from("<Q", data, offset)[0]
+
+
+def _probable_32_byte_key(data):
+    return (
+        len(data) == KEY_SZ
+        and len(set(data)) >= 15
+        and data not in {b"\x00" * KEY_SZ, b"\xff" * KEY_SZ}
+    )
+
+
+def _iter_region_chunks(regions, read_region, chunk_size=2 * 1024 * 1024, overlap=0):
+    """按块读取进程内存区域，可选 overlap 以覆盖边界上的模式。"""
+    for base, size in regions:
+        offset = 0
+        tail = b""
+        tail_base = base
+        while offset < size:
+            current_size = min(chunk_size, size - offset)
+            chunk = read_region(base + offset, current_size) or b""
+            data_base = tail_base if tail else base + offset
+            data = tail + chunk
+            if data:
+                yield data_base, data
+                if overlap:
+                    tail = data[-overlap:]
+                    tail_base = data_base + max(0, len(data) - len(tail))
+                else:
+                    tail = b""
+                    tail_base = base + offset + current_size
+            else:
+                tail = b""
+                tail_base = base + offset + current_size
+            offset += current_size
+
+
+def _find_bytes_in_regions(regions, read_region, needle):
+    addresses = set()
+    overlap = max(0, len(needle) - 1)
+    for data_base, haystack in _iter_region_chunks(regions, read_region, overlap=overlap):
+        pos = haystack.find(needle)
+        while pos >= 0:
+            addresses.add(data_base + pos)
+            pos = haystack.find(needle, pos + 1)
+    return addresses
+
+
+def _config_key_candidates(blob):
+    """从 Config.Cipher blob 中解码出候选 enc_key / salt。"""
+    if not blob or len(blob) > CONFIG_BLOB_MAX:
+        return []
+    decoded = _xor_repeat(blob, CONFIG_XOR_MASK)
+    out = []
+    seen = set()
+    for match in CONFIG_LITERAL_RE.finditer(decoded):
+        run = match.group(1).decode("ascii").lower()
+        starts = [0]
+        if len(run) > 96:
+            starts.extend(range(0, len(run) - 63, 32))
+            starts.append(len(run) - 64)
+        for start in dict.fromkeys(starts):
+            if start < 0 or start + 64 > len(run):
+                continue
+            enc_key_hex = run[start:start + 64]
+            try:
+                enc_key = bytes.fromhex(enc_key_hex)
+            except ValueError:
+                continue
+            if not _probable_32_byte_key(enc_key):
+                continue
+            embedded_salt = None
+            if start + 96 <= len(run):
+                embedded_salt = run[start + 64:start + 96]
+            item = (enc_key_hex, embedded_salt)
+            if item not in seen:
+                seen.add(item)
+                out.append(item)
+    return out
+
+
+def _verify_direct_key_candidate(
+    enc_key_hex, embedded_salt, db_files, salt_to_dbs, key_map, remaining_salts
+):
+    if not remaining_salts:
+        return 0
+    try:
+        enc_key = bytes.fromhex(enc_key_hex)
+    except ValueError:
+        return 0
+    if not _probable_32_byte_key(enc_key):
+        return 0
+    matched = 0
+    target_salts = (
+        [embedded_salt] if embedded_salt in remaining_salts else list(remaining_salts)
+    )
+    for salt_hex in target_salts:
+        if salt_hex not in remaining_salts:
+            continue
+        for _rel, _path, _sz, s, page1 in db_files:
+            if s == salt_hex and verify_enc_key(enc_key, page1):
+                key_map[salt_hex] = enc_key_hex
+                remaining_salts.discard(salt_hex)
+                dbs = salt_to_dbs[salt_hex]
+                print(f"\n  [FOUND] salt={salt_hex} (Config.Cipher)")
+                print(f"    enc_key={enc_key_hex}")
+                print(f"    数据库: {', '.join(dbs)}")
+                matched += 1
+                break
+    return matched
+
+
+def _scan_config_cipher(
+    pid, regions, read_region, read_mem, db_files, salt_to_dbs, key_map, remaining_salts
+):
+    """微信 4.1+：定位 WCDB Config.Cipher 对象，解码并校验密钥。"""
+    needle_addresses = _find_bytes_in_regions(regions, read_region, CONFIG_CIPHER_NAME)
+    if not needle_addresses:
+        print(f"[INFO] PID={pid} 未找到 Config.Cipher 字符串")
+        return 0
+
+    pair_patterns = [
+        struct.pack("<Q", addr) + struct.pack("<Q", len(CONFIG_CIPHER_NAME))
+        for addr in needle_addresses
+    ]
+    seen_candidates = set()
+    matched_salts = 0
+    node_count = 0
+    candidate_count = 0
+
+    for base, data in _iter_region_chunks(regions, read_region, overlap=0x80):
+        if not remaining_salts:
+            break
+        for pattern in pair_patterns:
+            pos = data.find(pattern)
+            while pos >= 0:
+                qaddr = base + pos
+                node = read_mem(qaddr - 0x10, 0x50)
+                if not node or len(node) < 0x40:
+                    pos = data.find(pattern, pos + 1)
+                    continue
+                if (
+                    _u64_from(node, 0x10) not in needle_addresses
+                    or _u64_from(node, 0x18) != len(CONFIG_CIPHER_NAME)
+                ):
+                    pos = data.find(pattern, pos + 1)
+                    continue
+                config_ptr = _u64_from(node, 0x28)
+                if not (0x10000 <= config_ptr < MAX_USER_ADDRESS):
+                    pos = data.find(pattern, pos + 1)
+                    continue
+                node_count += 1
+
+                obj = read_mem(config_ptr + 0x88, 0x28)
+                if not obj or len(obj) < 0x18:
+                    pos = data.find(pattern, pos + 1)
+                    continue
+                data_ptr = _u64_from(obj, 0x8)
+                data_len = _u64_from(obj, 0x10)
+                if not (
+                    0 < data_len <= CONFIG_BLOB_MAX
+                    and 0x10000 <= data_ptr < MAX_USER_ADDRESS
+                ):
+                    pos = data.find(pattern, pos + 1)
+                    continue
+                blob = read_mem(data_ptr, int(data_len))
+                if not blob or len(blob) != data_len:
+                    pos = data.find(pattern, pos + 1)
+                    continue
+
+                for enc_key_hex, embedded_salt in _config_key_candidates(blob):
+                    candidate = (enc_key_hex, embedded_salt)
+                    if candidate in seen_candidates:
+                        continue
+                    seen_candidates.add(candidate)
+                    candidate_count += 1
+                    matched = _verify_direct_key_candidate(
+                        enc_key_hex,
+                        embedded_salt,
+                        db_files,
+                        salt_to_dbs,
+                        key_map,
+                        remaining_salts,
+                    )
+                    if matched:
+                        matched_salts += matched
+                pos = data.find(pattern, pos + 1)
+
+    if matched_salts:
+        print(
+            f"[+] Config.Cipher 扫描命中 {matched_salts}/{len(salt_to_dbs)} salts "
+            f"(pid={pid}, candidates={candidate_count})"
+        )
+    else:
+        print(
+            f"[INFO] Config.Cipher 扫描未验证到密钥 "
+            f"(pid={pid}, nodes={node_count}, candidates={candidate_count})"
+        )
+    return matched_salts
+
+
 def extract_keys(db_dir, output_path, pid=None):
     """提取 Windows 微信数据库密钥。
 
@@ -87,43 +319,77 @@ def extract_keys(db_dir, output_path, pid=None):
     print("=" * 60)
 
     db_files, salt_to_dbs = collect_db_files(db_dir)
+    if not db_files:
+        raise RuntimeError(f"在 {db_dir} 未找到可解密的 .db 文件")
 
     print(f"\n找到 {len(db_files)} 个数据库, {len(salt_to_dbs)} 个不同的salt")
     for salt_hex, dbs in sorted(salt_to_dbs.items(), key=lambda x: len(x[1]), reverse=True):
         print(f"  salt {salt_hex}: {', '.join(dbs)}")
 
     pids = _get_pids() if pid is None else [(pid, 0)]
-
-    hex_re = re.compile(b"x'([0-9a-fA-F]{64,192})'")
     key_map = {}
     remaining_salts = set(salt_to_dbs.keys())
-    all_hex_matches = 0
     t0 = time.time()
 
-    for pid_val, mem_kb in pids:
+    # 1) 微信 4.1+：Config.Cipher 运行时扫描
+    print("\n[*] 尝试 Config.Cipher 运行时扫描（微信 4.1+）...")
+    for pid_val, _mem_kb in pids:
+        h = kernel32.OpenProcess(0x0010 | 0x0400, False, pid_val)
+        if not h:
+            print(f"[WARN] 无法打开进程 PID={pid_val}，跳过（请尝试以管理员身份运行）")
+            continue
+        try:
+            regions = _enum_regions(h)
+            total_mb = sum(s for _, s in regions) / 1024 / 1024
+            print(f"[*] 扫描 PID={pid_val} ({total_mb:.0f}MB, {len(regions)} 区域)")
+            _scan_config_cipher(
+                pid_val,
+                regions,
+                lambda base, size, _h=h: _read_mem(_h, base, size),
+                lambda addr, size, _h=h: _read_mem(_h, addr, size),
+                db_files,
+                salt_to_dbs,
+                key_map,
+                remaining_salts,
+            )
+        finally:
+            kernel32.CloseHandle(h)
+        if not remaining_salts:
+            print("\n[+] Config.Cipher 扫描已覆盖全部数据库")
+            cross_verify_keys(db_files, salt_to_dbs, key_map, print)
+            return save_results(db_files, salt_to_dbs, key_map, output_path, print)
+
+    if key_map:
+        print(
+            f"[INFO] Config.Cipher 部分命中: {len(key_map)}/{len(salt_to_dbs)} salts，"
+            "继续尝试老版本内存扫描补齐"
+        )
+    else:
+        print("[INFO] Config.Cipher 未命中，回退到老版本 x'<hex>' 内存扫描")
+
+    # 2) 老版本：raw key hex 模式扫描
+    hex_re = re.compile(b"x'([0-9a-fA-F]{64,192})'")
+    all_hex_matches = 0
+    for pid_val, _mem_kb in pids:
         h = kernel32.OpenProcess(0x0010 | 0x0400, False, pid_val)
         if not h:
             print(f"[WARN] 无法打开进程 PID={pid_val}，跳过")
             continue
-
         try:
             regions = _enum_regions(h)
             total_bytes = sum(s for _, s in regions)
-            total_mb = total_bytes / 1024 / 1024
-            print(f"\n[*] 扫描 PID={pid_val} ({total_mb:.0f}MB, {len(regions)} 区域)")
-
             scanned_bytes = 0
             for reg_idx, (base, size) in enumerate(regions):
+                if not remaining_salts:
+                    break
                 data = _read_mem(h, base, size)
                 scanned_bytes += size
                 if not data:
                     continue
-
                 all_hex_matches += scan_memory_for_keys(
                     data, hex_re, db_files, salt_to_dbs,
                     key_map, remaining_salts, base, pid_val, print,
                 )
-
                 if (reg_idx + 1) % 200 == 0:
                     elapsed = time.time() - t0
                     progress = scanned_bytes / total_bytes * 100 if total_bytes else 100
@@ -133,13 +399,19 @@ def extract_keys(db_dir, output_path, pid=None):
                     )
         finally:
             kernel32.CloseHandle(h)
-
         if not remaining_salts:
-            print(f"\n[+] 所有密钥已找到，跳过剩余进程")
+            print("\n[+] 所有密钥已找到，跳过剩余进程")
             break
 
     elapsed = time.time() - t0
     print(f"\n扫描完成: {elapsed:.1f}s, {len(pids)} 个进程, {all_hex_matches} hex模式")
+
+    if not key_map:
+        raise RuntimeError(
+            "未能从进程内存提取到密钥。微信 4.1+ 会先做 Config.Cipher 扫描，"
+            "再回退老版本内存扫描；请确认微信已登录、数据目录正确，"
+            "并以管理员身份运行。"
+        )
 
     cross_verify_keys(db_files, salt_to_dbs, key_map, print)
     return save_results(db_files, salt_to_dbs, key_map, output_path, print)

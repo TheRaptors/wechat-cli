@@ -6,7 +6,7 @@ import os
 
 from .config import load_config, STATE_DIR
 from .db_cache import DBCache
-from .key_utils import strip_key_metadata
+from .key_utils import normalize_all_keys
 from .messages import find_msg_db_keys
 
 
@@ -26,7 +26,8 @@ class AppContext:
             )
 
         with open(self.keys_file, encoding="utf-8") as f:
-            self.all_keys = strip_key_metadata(json.load(f))
+            # 兼容误把 xwechat_files 当 db_dir 时写出的 账号/db_storage/... 键名
+            self.all_keys = normalize_all_keys(json.load(f))
 
         self.cache = DBCache(self.all_keys, self.db_dir)
         atexit.register(self.cache.cleanup)

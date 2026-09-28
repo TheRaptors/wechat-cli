@@ -14,6 +14,10 @@ import struct
 PAGE_SZ = 4096
 KEY_SZ = 32
 SALT_SZ = 16
+SQLITE_HDR = b"SQLite format 3\x00"
+
+# SQLCipher 4 标准：passphrase -> enc_key 的 PBKDF2 轮数
+PBKDF2_ITERATIONS = 256000
 
 
 def verify_enc_key(enc_key, db_page1):
@@ -26,6 +30,33 @@ def verify_enc_key(enc_key, db_page1):
     hm = hmac_mod.new(mac_key, hmac_data, hashlib.sha512)
     hm.update(struct.pack("<I", 1))
     return hm.digest() == stored_hmac
+
+
+def derive_keys_from_passphrase(passphrase, db_files, salt_to_dbs, print_fn=None):
+    """用 32 字节 passphrase 对每个 salt 做 PBKDF2，派生并校验 enc_key。
+
+    微信 4.1+ 内存里通常只剩 passphrase，需要再派生才能得到真正的 AES 密钥。
+    每个 salt 约需数百毫秒（256000 轮 SHA-512），库多时整体可能要几十秒。
+
+    Returns:
+        dict: salt_hex -> enc_key_hex
+    """
+    if isinstance(passphrase, str):
+        passphrase = bytes.fromhex(passphrase)
+    key_map = {}
+    total = len(salt_to_dbs)
+    for i, salt_hex in enumerate(salt_to_dbs):
+        salt = bytes.fromhex(salt_hex)
+        enc_key = hashlib.pbkdf2_hmac(
+            "sha512", passphrase, salt, PBKDF2_ITERATIONS, dklen=KEY_SZ
+        )
+        for _rel, _path, _sz, s, page1 in db_files:
+            if s == salt_hex and verify_enc_key(enc_key, page1):
+                key_map[salt_hex] = enc_key.hex()
+                break
+        if print_fn and ((i + 1) % 5 == 0 or i == total - 1):
+            print_fn(f"  PBKDF2 派生: {i + 1}/{total} ({len(key_map)} 验证通过)")
+    return key_map
 
 
 def collect_db_files(db_dir):
@@ -47,7 +78,17 @@ def collect_db_files(db_dir):
                 continue
             with open(path, "rb") as f:
                 page1 = f.read(PAGE_SZ)
+            # 明文 SQLite（未加密）—— salt 会变成 "SQLite format 3\0"，跳过
+            if page1.startswith(SQLITE_HDR):
+                continue
             rel = os.path.relpath(path, db_dir)
+            # 若扫描根目录高于 db_storage，仍按相对 db_storage 存键名
+            marker = f"{os.sep}db_storage{os.sep}"
+            idx = rel.find(marker)
+            if idx >= 0:
+                rel = rel[idx + len(marker):]
+            elif rel.startswith(f"db_storage{os.sep}"):
+                rel = rel[len(f"db_storage{os.sep}"):]
             salt = page1[:SALT_SZ].hex()
             db_files.append((rel, path, size, salt, page1))
             salt_to_dbs.setdefault(salt, []).append(rel)
