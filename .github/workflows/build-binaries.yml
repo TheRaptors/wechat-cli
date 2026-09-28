@@ -28,9 +28,6 @@ jobs:
           - platform: darwin-arm64
             runner: macos-14
             artifact: wechat-cli
-          - platform: darwin-x64
-            runner: macos-13
-            artifact: wechat-cli
 
     steps:
       - name: Checkout
@@ -63,7 +60,7 @@ jobs:
           "$BIN" --help >/dev/null
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: wechat-cli-${{ matrix.platform }}
           path: npm/platforms/${{ matrix.platform }}/bin/${{ matrix.artifact }}
@@ -76,7 +73,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           path: dist
 
