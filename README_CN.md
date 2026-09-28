@@ -285,6 +285,25 @@ wechat-cli favorites --query "计算机网络"    # 搜索收藏
 
 **类型：** text、image、article、card、video
 
+### 解密数据库到本地文件
+
+先完成 `wechat-cli init`，再用仓库内脚本导出明文 SQLite：
+
+```bash
+# 列出可解密的库
+python scripts/decrypt_db.py --list
+
+# 解密聊天记录 / 收藏（默认输出到当前目录，文件名带日期）
+python scripts/decrypt_db.py message_0.db
+python scripts/decrypt_db.py favorite.db
+
+# 指定输出路径
+python scripts/decrypt_db.py message/message_0.db -o message_0_2026.09.28.db
+python scripts/decrypt_db.py favorite/favorite.db -o favorite_plain.db
+```
+
+输出可用 DB Browser for SQLite / `sqlite3` 打开。密钥来自 `~/.wechat-cli/all_keys.json`，源库目录来自 `~/.wechat-cli/config.json`。
+
 ### `unread` — 未读会话
 
 ```bash

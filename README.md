@@ -287,6 +287,25 @@ wechat-cli favorites --query "machine learning"  # Search
 
 **Types:** text, image, article, card, video
 
+### Decrypt databases to local files
+
+After `wechat-cli init`, use the bundled script to export plaintext SQLite:
+
+```bash
+# List decryptable databases
+python scripts/decrypt_db.py --list
+
+# Decrypt chat history / favorites (writes to cwd with a date suffix by default)
+python scripts/decrypt_db.py message_0.db
+python scripts/decrypt_db.py favorite.db
+
+# Custom output path
+python scripts/decrypt_db.py message/message_0.db -o message_0_2026.09.28.db
+python scripts/decrypt_db.py favorite/favorite.db -o favorite_plain.db
+```
+
+Open the output with DB Browser for SQLite / `sqlite3`. Keys come from `~/.wechat-cli/all_keys.json`; the source `db_dir` comes from `~/.wechat-cli/config.json`.
+
 ### `unread` — Unread Sessions
 
 ```bash
