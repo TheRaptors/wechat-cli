@@ -1,0 +1,105 @@
+name: Build binaries
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: win32-x64
+            runner: windows-latest
+            artifact: wechat-cli.exe
+          - platform: linux-x64
+            runner: ubuntu-latest
+            artifact: wechat-cli
+          - platform: darwin-arm64
+            runner: macos-14
+            artifact: wechat-cli
+          - platform: darwin-x64
+            runner: macos-13
+            artifact: wechat-cli
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pyinstaller
+
+      - name: Build binary
+        run: python npm/scripts/build.py ${{ matrix.platform }}
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          BIN="npm/platforms/${{ matrix.platform }}/bin/${{ matrix.artifact }}"
+          chmod +x "$BIN" || true
+          "$BIN" --help
+          "$BIN" --version
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wechat-cli-${{ matrix.platform }}
+          path: npm/platforms/${{ matrix.platform }}/bin/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    name: Attach to GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Pack release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          for dir in dist/wechat-cli-*; do
+            platform="${dir#dist/wechat-cli-}"
+            if [[ -f "$dir/wechat-cli.exe" ]]; then
+              cp "$dir/wechat-cli.exe" "release/wechat-cli-${platform}.exe"
+            elif [[ -f "$dir/wechat-cli" ]]; then
+              cp "$dir/wechat-cli" "release/wechat-cli-${platform}"
+              chmod +x "release/wechat-cli-${platform}"
+            else
+              echo "Missing binary in $dir" >&2
+              ls -la "$dir" >&2
+              exit 1
+            fi
+          done
+          ls -la release
+
+      - name: Create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

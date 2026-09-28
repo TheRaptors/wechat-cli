@@ -98,6 +98,9 @@ def main():
             platforms = ["darwin-arm64"]
         elif current == "darwin-x86_64" or current == "darwin-amd64":
             platforms = ["darwin-x64"]
+        elif current.startswith("windows-") or "win32" in current:
+            # e.g. Windows-AMD64 -> windows-amd64
+            platforms = ["win32-x64"]
         else:
             # Try to match
             platforms = []
